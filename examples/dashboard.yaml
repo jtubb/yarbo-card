@@ -1,0 +1,25 @@
+# Minimal usage
+type: custom:yarbo-card
+prefix: senor_choppy
+
+# ---
+
+# With map panel alongside
+type: vertical-stack
+cards:
+  - type: custom:yarbo-card
+    prefix: senor_choppy
+  - type: map
+    entities:
+      - device_tracker.senor_choppy_location
+    default_zoom: 19
+    hours_to_show: 1
+
+# ---
+
+# Compact + no advanced section
+type: custom:yarbo-card
+prefix: senor_choppy
+compact: true
+show_advanced: false
+name: Driveway Snow Robot
