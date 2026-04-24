@@ -93,14 +93,14 @@ Minimum config:
 
 ```yaml
 type: custom:yarbo-card
-prefix: senor_choppy   # the slug of your device's entities
+prefix: my_robot   # the slug of your device's entities
 ```
 
 Full config reference:
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `prefix` | string | *inferred* | Entity prefix (e.g. `senor_choppy`) |
+| `prefix` | string | *inferred* | Entity prefix (e.g. `my_robot`) |
 | `name` | string | *inferred* | Display name override |
 | `show_map` | bool | `true` | Render the SVG map |
 | `map_height` | number | `240` | Map height in pixels |

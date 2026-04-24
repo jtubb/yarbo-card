@@ -201,6 +201,37 @@ class YarboMap extends LitElement {
 
   @query("svg") private _svg?: SVGSVGElement;
 
+  private _resizeObserver?: ResizeObserver;
+  private _observedSvg?: SVGSVGElement;
+
+  public connectedCallback(): void {
+    super.connectedCallback();
+    if ("ResizeObserver" in window) {
+      this._resizeObserver = new ResizeObserver(() => {
+        // Kick a re-render so the robot-scale recomputes with new dims.
+        this.requestUpdate();
+      });
+    }
+  }
+
+  public disconnectedCallback(): void {
+    super.disconnectedCallback();
+    this._resizeObserver?.disconnect();
+    this._resizeObserver = undefined;
+    this._observedSvg = undefined;
+  }
+
+  protected updated(changed: PropertyValues): void {
+    super.updated(changed);
+    if (this._svg && this._svg !== this._observedSvg) {
+      this._resizeObserver?.disconnect();
+      this._resizeObserver?.observe(this._svg);
+      this._observedSvg = this._svg;
+      // First observation fires synchronously with current size; that's
+      // enough to let the next render compute robot scale correctly.
+    }
+  }
+
   private _colors(): Required<YarboColors> {
     return { ...DEFAULT_COLORS, ...(this.colors ?? {}) };
   }
@@ -287,6 +318,23 @@ class YarboMap extends LitElement {
     const vbY = effCy - vbH / 2;
     // Stroke/point sizes scale inversely with zoom so they don't balloon
     const strokeScale = 1 / effZoom;
+    // For the robot glyph specifically: we want a constant on-screen
+    // size regardless of zoom OR the SVG element's physical dimensions
+    // (which change between inline-card / fullscreen). Compute using
+    // the actual SVG bounding rect when available.
+    let robotScale = strokeScale;
+    let obstacleScale = strokeScale;
+    const rect = this._svg?.getBoundingClientRect();
+    if (rect && rect.width > 0 && rect.height > 0) {
+      // preserveAspectRatio="meet" uses the smaller ratio.
+      const pxPerUnit = Math.min(rect.width / vbW, rect.height / vbH);
+      if (pxPerUnit > 0) {
+        // Robot: outer halo r=36 units → target ~32 screen px.
+        robotScale = 32 / (36 * pxPerUnit);
+        // Obstacle: outer halo r=6 units → target ~12 screen px.
+        obstacleScale = 12 / (6 * pxPerUnit);
+      }
+    }
 
     // Collect render items per zone type so we can z-order
     const polygons: SVGTemplateResult[] = [];
@@ -436,9 +484,9 @@ class YarboMap extends LitElement {
 
     const planned = this._renderPlannedPath(project, c);
     const trail = this._renderTrail(project, strokeScale, c);
-    const obstacles = this._renderObstacles(project, c);
+    const obstacles = this._renderObstacles(project, obstacleScale, c);
     const robot = this.robot
-      ? this._renderRobot(this.robot, project, strokeScale, c)
+      ? this._renderRobot(this.robot, project, robotScale, c)
       : null;
     const legend = this._renderLegend(feats, c);
 
@@ -580,6 +628,7 @@ class YarboMap extends LitElement {
 
   private _renderObstacles(
     project: (lon: number, lat: number) => [number, number],
+    scale: number,
     c: Required<YarboColors>,
   ): SVGTemplateResult | null {
     const feats = this.obstacles?.features;
@@ -603,7 +652,10 @@ class YarboMap extends LitElement {
       const cx = sx / pts.length;
       const cy = sy / pts.length;
       marks.push(svg`
-        <g class="obstacle" transform="translate(${cx.toFixed(2)},${cy.toFixed(2)})">
+        <g
+          class="obstacle"
+          transform="translate(${cx.toFixed(2)},${cy.toFixed(2)}) scale(${scale})"
+        >
           <circle r="6" fill=${color} fill-opacity="0.25"
             vector-effect="non-scaling-stroke" />
           <circle r="3" fill=${color} stroke="#ffffff"

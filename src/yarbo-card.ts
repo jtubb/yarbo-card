@@ -112,7 +112,7 @@ class YarboCard extends LitElement {
   }
 
   public static getStubConfig(hass: HomeAssistant): YarboCardConfig {
-    const prefix = inferPrefix(hass) ?? "senor_choppy";
+    const prefix = inferPrefix(hass) ?? "my_robot";
     return { type: "custom:yarbo-card", prefix };
   }
 

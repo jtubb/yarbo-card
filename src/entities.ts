@@ -63,7 +63,7 @@ export function deviceName(hass: HomeAssistant, ents: YarboEntities, fallback: s
   if (anchor && hass.states[anchor]) {
     const friendly = hass.states[anchor].attributes?.friendly_name;
     if (typeof friendly === "string") {
-      // Friendly names look like "Senor Choppy Online" — strip the trailing label
+      // Friendly names look like "<Device name> Online" — strip the trailing label
       const parts = friendly.split(" ");
       if (parts.length > 1) return parts.slice(0, -1).join(" ");
       return friendly;

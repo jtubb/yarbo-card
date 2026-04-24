@@ -2,7 +2,9 @@ import { LitElement, html, css, type TemplateResult, nothing } from "lit";
 import { property, state } from "lit/decorators.js";
 import {
   COLOR_LABELS,
+  COLOR_THEMES,
   DEFAULT_COLORS,
+  THEME_LABELS,
   type HomeAssistant,
   type YarboCardConfig,
   type YarboColors,
@@ -66,6 +68,54 @@ class YarboCardEditor extends LitElement {
     this._fire(next);
   }
 
+  // Detect which preset theme (if any) the current colors match exactly.
+  // Returns "okabe-ito" when no overrides are present (default theme).
+  private _detectTheme(): string {
+    const overrides = this._config?.colors ?? {};
+    const effective: Required<YarboColors> = {
+      ...DEFAULT_COLORS,
+      ...overrides,
+    };
+    for (const [name, palette] of Object.entries(COLOR_THEMES)) {
+      let match = true;
+      for (const key of Object.keys(palette) as Array<keyof YarboColors>) {
+        if (
+          (effective[key] ?? "").toLowerCase() !==
+          palette[key].toLowerCase()
+        ) {
+          match = false;
+          break;
+        }
+      }
+      if (match) return name;
+    }
+    return "custom";
+  }
+
+  private _applyTheme(name: string): void {
+    if (!this._config) return;
+    if (name === "custom") return;
+    const palette = COLOR_THEMES[name];
+    if (!palette) return;
+    // Store only the keys that differ from the global default so the
+    // config stays minimal when picking the default theme.
+    const colors: YarboColors = {};
+    for (const key of Object.keys(palette) as Array<keyof YarboColors>) {
+      if (
+        palette[key].toLowerCase() !== DEFAULT_COLORS[key].toLowerCase()
+      ) {
+        colors[key] = palette[key];
+      }
+    }
+    const next: YarboCardConfig = { ...this._config };
+    if (Object.keys(colors).length === 0) {
+      delete next.colors;
+    } else {
+      next.colors = colors;
+    }
+    this._fire(next);
+  }
+
   protected render(): TemplateResult | typeof nothing {
     if (!this._config) return nothing;
     const c = this._config;
@@ -106,7 +156,7 @@ class YarboCardEditor extends LitElement {
             <input
               type="text"
               .value=${c.prefix ?? ""}
-              placeholder="senor_choppy"
+              placeholder="my_robot"
               @change=${(e: Event) =>
                 this._updateField(
                   "prefix",
@@ -221,6 +271,28 @@ class YarboCardEditor extends LitElement {
                 </button>`
               : nothing}
           </div>
+          <div class="text-row">
+            <label>Theme preset</label>
+            <select
+              .value=${this._detectTheme()}
+              @change=${(e: Event) =>
+                this._applyTheme((e.target as HTMLSelectElement).value)}
+            >
+              ${Object.entries(THEME_LABELS).map(
+                ([value, label]) => html`
+                  <option
+                    value=${value}
+                    ?selected=${this._detectTheme() === value}
+                  >
+                    ${label}
+                  </option>
+                `,
+              )}
+              <option value="custom" ?selected=${this._detectTheme() === "custom"}>
+                Custom (current overrides)
+              </option>
+            </select>
+          </div>
           <h4>Trails</h4>
           ${colorRow("trail_completed")}
           ${colorRow("trail_transit")}
@@ -303,7 +375,8 @@ class YarboCardEditor extends LitElement {
       min-width: 70px;
     }
     .text-row input[type="text"],
-    .text-row input[type="number"] {
+    .text-row input[type="number"],
+    .text-row select {
       flex: 1;
       padding: 6px 8px;
       background: var(--secondary-background-color);
