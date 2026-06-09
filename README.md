@@ -108,6 +108,102 @@ Full config reference:
 | `compact` | bool | `false` | Tighter paddings and gaps |
 | `rain_threshold` | number | `500` | Rain-sensor value at/above which to show alert |
 | `colors` | object | *(Okabe-Ito)* | Per-element color overrides — see editor |
+| `scheduler` | object | *(off)* | Enables the Scheduler section — see below |
+
+## Scheduler
+
+The auto-mowing scheduler lives in the YarboHA integration (Python),
+not the card. The card just shows status and exposes Run Now / Skip /
+Pause buttons; everything else — schedule definitions, persistence,
+the per-minute evaluator, plan-start preflight — runs in the
+integration so it works whether the dashboard is open or not.
+
+Requires the
+[`scheduler` branch of `jtubb/YarboHA`](https://github.com/jtubb/YarboHA/tree/scheduler).
+Until that's merged upstream, the easiest path is to point HACS or
+your manual install at the fork.
+
+### What it does
+
+- **Per-plan minimum interval** — "front yard every 3 days, back yard
+  every 5". Manual runs from any source (card, Yarbo app, voice) also
+  update the cooldown clock — the integration listens to plan-start
+  events directly.
+- **Weather hold** — skip when a configured `weather.*` entity reports
+  rainy / pouring / etc.
+- **Quiet hours** — no runs inside a time window (cross-midnight
+  aware), optionally combined with a sun-elevation gate ("after
+  dark").
+- **Battery floor** — skip if battery < N %.
+- **Presence hold** — skip if any of a list of person/device_tracker/
+  zone entities are `home`.
+- **Pre-run notification** — push a notification N minutes before
+  starting; press *Skip* during the grace window to cancel.
+- **Per-schedule pause** + **global per-device pause** — disable
+  individual schedules without deleting them, or halt everything with
+  one switch.
+
+### Setup
+
+1. Install the YarboHA integration's `scheduler` branch and restart
+   Home Assistant.
+2. **Settings → Devices & Services → Yarbo → Configure → "Add a
+   schedule"**. Pick a plan, set the interval, configure any optional
+   gates. Repeat per plan.
+3. In your dashboard's Yarbo card config, enable the section:
+
+   ```yaml
+   type: custom:yarbo-card
+   prefix: my_yarbo
+   scheduler:
+     enabled: true
+   ```
+
+   Or use the visual editor's "Show scheduler section on the card"
+   toggle. The card auto-discovers the integration-provided schedule
+   entities — no other config needed.
+
+### Entities exposed (per schedule)
+
+| Entity | Purpose |
+|---|---|
+| `sensor.<prefix>_schedule_<slug>` | State = current hold reason. Attributes: `next_eligible_at`, `last_run`, `interval_days`, `skip_next`, `schedule_enabled`, plus all the gate values. |
+| `button.<prefix>_schedule_<slug>_run_now` | Bypass cooldown and start the plan now. Honors all standard preflight (online, RTK, no plan running). |
+| `button.<prefix>_schedule_<slug>_skip_next` | Toggle the per-schedule skip flag. Clears automatically after the next eligible window passes. |
+| `switch.<prefix>_schedule_<slug>_enabled` | Per-schedule enable/disable (preserves history). |
+
+Plus per device:
+
+| Entity | Purpose |
+|---|---|
+| `switch.<prefix>_scheduler_enabled` | Master kill-switch for all schedules on this device. |
+
+### Verification
+
+- Open Developer Tools → States and inspect
+  `sensor.<prefix>_schedule_<slug>`. The `state` is the hold reason
+  (`eligible`, `cooldown`, `weather`, `sleep`, `battery`, `presence`,
+  `paused`, `skipped`, `robot-offline`, `robot-busy`).
+- For end-to-end testing, edit a schedule to `interval_days: 0.01`
+  (~14 minutes), wait, and watch the integration log
+  (`[scheduler] firing '<plan>' on <sn>`).
+
+### Optional: rain → no-go zones
+
+`blueprints/automation/yarbo/yarbo_rain_nogo_manager.yaml` is a small
+HA blueprint (a hundred lines, no scheduler state) that enables a set
+of no-go zones whenever a rain sensor flips active, and releases them
+after a configurable grace period. It's a separate concern from the
+scheduler — kept as a blueprint because it needs no persistence and
+the standard automation editor handles it cleanly.
+
+To use:
+
+1. Copy `yarbo_rain_nogo_manager.yaml` into
+   `<config>/blueprints/automation/yarbo/`.
+2. **Settings → Automations → Create Automation → Use Blueprint →
+   "Yarbo Rain No-Go Manager"**. Configure your rain sensor, the zone
+   IDs to enable, and the grace period.
 
 ## Integration patches required
 

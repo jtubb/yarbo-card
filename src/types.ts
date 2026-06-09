@@ -27,6 +27,19 @@ export interface YarboCardConfig extends LovelaceCardConfig {
   /** Rain-sensor threshold above which the card surfaces a rain alert.
    * The Yarbo phone app uses 500 by default. */
   rain_threshold?: number;
+  scheduler?: YarboSchedulerConfig;
+}
+
+export interface YarboSchedulerConfig {
+  /** Show the Scheduler section on the card. The schedules themselves
+   * (plan, interval, weather, etc.) are configured via the YarboHA
+   * integration's options flow — Settings → Devices & Services →
+   * Yarbo → Configure → "Add a schedule".
+   *
+   * The card auto-discovers schedule entities by entity-id pattern
+   * derived from the card's `prefix`, so no per-plan config is needed
+   * here. */
+  enabled: boolean;
 }
 
 export const DEFAULT_COLORS: Required<YarboColors> = {
@@ -188,6 +201,7 @@ export interface YarboEntities {
   planSelect?: string;
   workingStateSelect?: string;
   planStartPercent?: string;
+  planProgress?: string;
   volume?: string;
   soundSwitch?: string;
   headlightSwitch?: string;

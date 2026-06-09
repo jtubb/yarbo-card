@@ -8,6 +8,7 @@ import {
   type HomeAssistant,
   type YarboCardConfig,
   type YarboColors,
+  type YarboSchedulerConfig,
 } from "./types";
 
 class YarboCardEditor extends LitElement {
@@ -67,6 +68,30 @@ class YarboCardEditor extends LitElement {
     delete next.colors;
     this._fire(next);
   }
+
+  private _updateScheduler<K extends keyof YarboSchedulerConfig>(
+    key: K,
+    value: YarboSchedulerConfig[K] | undefined,
+  ): void {
+    if (!this._config) return;
+    const current: YarboSchedulerConfig =
+      this._config.scheduler ?? { enabled: false };
+    const nextSched: YarboSchedulerConfig = { ...current };
+    if (value === undefined || value === null) {
+      delete (nextSched as unknown as Record<string, unknown>)[key as string];
+    } else {
+      (nextSched as unknown as Record<string, unknown>)[key as string] = value;
+    }
+    const next: YarboCardConfig = { ...this._config };
+    // Drop the whole block when it carries no information.
+    if (!nextSched.enabled && Object.keys(nextSched).length <= 1) {
+      delete next.scheduler;
+    } else {
+      next.scheduler = nextSched;
+    }
+    this._fire(next);
+  }
+
 
   // Detect which preset theme (if any) the current colors match exactly.
   // Returns "okabe-ito" when no overrides are present (default theme).
@@ -259,6 +284,36 @@ class YarboCardEditor extends LitElement {
         </div>
 
         <div class="section">
+          <h3>Scheduler</h3>
+          <div class="toggle-row">
+            <label>
+              <input
+                type="checkbox"
+                .checked=${c.scheduler?.enabled ?? false}
+                @change=${(e: Event) =>
+                  this._updateScheduler(
+                    "enabled",
+                    (e.target as HTMLInputElement).checked,
+                  )}
+              />
+              Show scheduler section on the card
+            </label>
+          </div>
+          ${c.scheduler?.enabled
+            ? html`
+                <div class="hint">
+                  Schedules themselves (plan, interval, weather, quiet
+                  hours, presence, etc.) are configured in the YarboHA
+                  integration's options:
+                  <strong>Settings → Devices &amp; Services → Yarbo →
+                  Configure → "Add a schedule"</strong>. The card just
+                  shows status and exposes Run Now / Skip / Pause.
+                </div>
+              `
+            : nothing}
+        </div>
+
+        <div class="section">
           <div class="section-header">
             <h3>Colors</h3>
             ${c.colors
@@ -403,6 +458,19 @@ class YarboCardEditor extends LitElement {
     button.reset:hover {
       color: var(--primary-text-color);
       background: var(--secondary-background-color);
+    }
+    .hint {
+      font-size: 0.78rem;
+      color: var(--secondary-text-color);
+      line-height: 1.4;
+    }
+    .hint code {
+      font-family: var(--code-font-family, monospace);
+      font-size: 0.75rem;
+    }
+    .hint strong {
+      color: var(--primary-text-color);
+      font-weight: 500;
     }
   `;
 }

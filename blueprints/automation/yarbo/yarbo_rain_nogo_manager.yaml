@@ -1,0 +1,149 @@
+blueprint:
+  name: Yarbo Rain No-Go Manager
+  description: >
+    When a rain sensor reports rain, enable a configurable set of no-go
+    zones (which BLOCK the mower from those areas) and optionally stop
+    a running plan. When rain ends, wait a grace period and then
+    release the zones.
+
+    A new rain event during the grace period cancels the release; the
+    automation runs in `restart` mode so the timer is reset cleanly.
+
+    NOTE on zone semantics: in this codebase, `enable=true` on a no-go
+    zone means the zone IS BLOCKING the mower (verified at
+    src/yarbo-card.ts:1019 and :303). This blueprint enables zones to
+    block during rain.
+
+    One instance per device.
+  domain: automation
+  source_url: https://github.com/yarbo-card/blueprints
+  input:
+    target_device:
+      name: Yarbo device
+      description: The HA device used by the yarbo.set_nogozone_enabled service.
+      selector:
+        device:
+          integration: yarbo
+    rain_sensor:
+      name: Rain sensor
+      description: >
+        Any entity whose state changes when rain starts/stops. For a
+        binary_sensor this is typically 'on'/'off'. For a weather
+        entity, use 'rainy'/'pouring' as the active states.
+      selector:
+        entity: {}
+    rain_active_states:
+      name: Rain-active states
+      description: >
+        States that count as "raining now". Default suits a weather.*
+        entity. For a binary_sensor.* use ['on'].
+      default: ["rainy", "pouring", "snowy-rainy", "lightning-rainy"]
+      selector:
+        select:
+          multiple: true
+          custom_value: true
+          options:
+            - "on"
+            - rainy
+            - pouring
+            - snowy-rainy
+            - lightning-rainy
+    zone_ids:
+      name: No-go zone IDs
+      description: >
+        Zone IDs (numeric or string) to enable while it's raining. Find
+        the IDs by inspecting the mapZones sensor's nogo_zones attribute
+        in Developer Tools → States.
+      selector:
+        text:
+          multiple: true
+    grace_minutes:
+      name: Grace period after rain ends (minutes)
+      default: 60
+      selector:
+        number:
+          min: 0
+          max: 720
+          step: 5
+          mode: box
+    stop_running_plan:
+      name: Stop a running plan when rain starts
+      default: true
+      selector:
+        boolean: {}
+    auto_plan_status_sensor:
+      name: auto_plan_status sensor (used to decide whether to stop)
+      selector:
+        entity:
+          domain: sensor
+    stop_plan_button:
+      name: Stop-plan button
+      description: Required when "Stop a running plan when rain starts" is on.
+      default: ""
+      selector:
+        entity:
+          domain: button
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  rain_sensor: !input rain_sensor
+  rain_active_states: !input rain_active_states
+  zone_ids: !input zone_ids
+  stop_running_plan: !input stop_running_plan
+  auto_plan_status_sensor: !input auto_plan_status_sensor
+  stop_plan_button: !input stop_plan_button
+
+trigger:
+  - platform: state
+    entity_id: !input rain_sensor
+
+action:
+  - choose:
+      # Branch A: rain just became active.
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.to_state.state in rain_active_states }}"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ stop_running_plan and stop_plan_button not in ('', none)
+                         and states(auto_plan_status_sensor) not in ['Idle','Standby','Completed','unknown'] }}
+                sequence:
+                  - service: button.press
+                    target:
+                      entity_id: "{{ stop_plan_button }}"
+                  - delay:
+                      seconds: 5
+          - repeat:
+              for_each: "{{ zone_ids }}"
+              sequence:
+                - service: yarbo.set_nogozone_enabled
+                  data:
+                    device_id: !input target_device
+                    zone_id: "{{ repeat.item }}"
+                    enabled: true
+
+      # Branch B: rain just cleared. Wait the grace period; if rain
+      # restarts, this whole automation restarts (mode: restart) and
+      # re-enters Branch A, so the wait is implicitly cancelled.
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.to_state.state not in rain_active_states }}"
+        sequence:
+          - delay:
+              minutes: !input grace_minutes
+          # Defensive: rain hasn't returned in the meantime.
+          - condition: template
+            value_template: "{{ states(rain_sensor) not in rain_active_states }}"
+          - repeat:
+              for_each: "{{ zone_ids }}"
+              sequence:
+                - service: yarbo.set_nogozone_enabled
+                  data:
+                    device_id: !input target_device
+                    zone_id: "{{ repeat.item }}"
+                    enabled: false

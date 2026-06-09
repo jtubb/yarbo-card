@@ -21,7 +21,7 @@ export interface GeoJsonFeatureCollection {
   features: GeoJsonFeature[];
 }
 
-export type TrailPhase = "heading" | "cleaning";
+export type TrailPhase = "heading" | "cleaning" | "recharging";
 
 export interface TrailPoint {
   lon: number;
@@ -159,6 +159,17 @@ class YarboMap extends LitElement {
   /** Set of no-go zone IDs (as strings) that are currently disabled.
    * Disabled zones render dimmed + dashed instead of as a hard no-go. */
   @property({ attribute: false }) public disabledNogoIds?: Set<string>;
+  /** When true, single taps on the map emit a `map-click` CustomEvent
+   * carrying {lat, lon}. Drag-to-pan is still active for sustained
+   * pointer motion above ``CLICK_MOVE_THRESHOLD_PX``. */
+  @property({ type: Boolean }) public waypointMode = false;
+  /** Optional waypoint markers to overlay. Each is {lat, lon, label?}. */
+  @property({ attribute: false }) public waypoints?: Array<{
+    lat: number; lon: number; label?: string;
+  }>;
+  /** Whether the mower is idle. Gates the "Goto waypoint" menu item —
+   * we don't want to drop waypoints mid-plan. */
+  @property({ type: Boolean }) public idle = true;
 
   // Pan/zoom state. cx/cy are viewBox center in "base" viewport units
   // (pre-zoom). zoom=1 shows the fitted bbox; >1 zooms in.
@@ -175,6 +186,13 @@ class YarboMap extends LitElement {
   private _baseW = 1000;
   private _baseH = 400;
   private _initializedCenter = false;
+  // Projection parameters captured each render — used to invert
+  // (viewBox xy) ↔ (lat lon) for waypoint clicks.
+  private _projMinLat = 0;
+  private _projMinLon = 0;
+  private _projSpanLat = 1;
+  private _projSpanLon = 1;
+  private _projLonScale = 1;
   // Last effective (robot-centered) viewport coords — captured each
   // render while follow-mode is on. Used to keep the frame in place
   // when the user toggles follow off.
@@ -187,6 +205,10 @@ class YarboMap extends LitElement {
   private _dragStartCx = 0;
   private _dragStartCy = 0;
   private _activePointer: number | null = null;
+  // When pointerdown landed on a waypoint marker, this holds its
+  // index. A subsequent low-motion pointerup fires waypoint-click
+  // instead of map-click (delete vs. place).
+  private _pointerDownWaypointIdx: number | null = null;
 
   // Multi-touch pinch tracking. Holds every currently-down pointer so we
   // can compute a distance between two fingers.
@@ -298,6 +320,12 @@ class YarboMap extends LitElement {
       const y = h - ((lat - minLat) / spanLat) * h;
       return [x, y];
     };
+    // Stash projection params so click handlers can invert it.
+    this._projMinLat = minLat;
+    this._projMinLon = minLon;
+    this._projSpanLat = spanLat;
+    this._projSpanLon = spanLon;
+    this._projLonScale = lonScale;
 
     // Dynamic viewBox for pan/zoom. When follow-robot is on, the center
     // tracks the robot; zoom is whatever the user has set. When follow is
@@ -488,6 +516,9 @@ class YarboMap extends LitElement {
     const robot = this.robot
       ? this._renderRobot(this.robot, project, robotScale, c)
       : null;
+    const waypointMarkers = (this.waypoints && this.waypoints.length)
+      ? this._renderWaypoints(project, robotScale, c)
+      : null;
     const legend = this._renderLegend(feats, c);
 
     const wrapStyle = (() => {
@@ -530,6 +561,7 @@ class YarboMap extends LitElement {
           ${planned}
           ${trail}
           ${obstacles}
+          ${waypointMarkers}
           ${robot}
         </svg>
         ${legend}
@@ -617,6 +649,24 @@ class YarboMap extends LitElement {
                         : "mdi:fullscreen"}
                     ></ha-icon>
                     <span>${this._fullscreen ? "Exit fullscreen" : "Fullscreen"}</span>
+                  </button>
+                  <button
+                    class="zoom-menu-item ${this.waypointMode ? "active" : ""}"
+                    @click=${() => {
+                      this.dispatchEvent(new CustomEvent(
+                        "request-waypoint-mode",
+                        {
+                          detail: { active: !this.waypointMode },
+                          bubbles: true, composed: true,
+                        },
+                      ));
+                      this._menuOpen = false;
+                    }}
+                    ?disabled=${!this.idle && !this.waypointMode}
+                    role="menuitem"
+                  >
+                    <ha-icon icon="mdi:map-marker-plus"></ha-icon>
+                    <span>${this.waypointMode ? "Exit waypoint" : "Goto waypoint"}</span>
                   </button>
                 </div>
               `
@@ -763,6 +813,21 @@ class YarboMap extends LitElement {
               ><title>Transit path (moving to area)</title></path>
             `;
           }
+          if (seg.phase === "recharging") {
+            return svg`
+              <path
+                d=${seg.d}
+                fill="none"
+                stroke=${c.trail_transit}
+                stroke-width="4"
+                stroke-dasharray="3 6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-opacity="0.7"
+                vector-effect="non-scaling-stroke"
+              ><title>Recharge / return to dock</title></path>
+            `;
+          }
           return svg`
             <path
               d=${seg.d}
@@ -823,6 +888,63 @@ class YarboMap extends LitElement {
     `;
   }
 
+  private _renderWaypoints(
+    project: (lon: number, lat: number) => [number, number],
+    scale: number,
+    c: Required<YarboColors>,
+  ): SVGTemplateResult {
+    const accent = c.robot;
+    const r = 11 * scale;
+    const stroke = Math.max(0.8, scale * 1.4);
+    const pts = (this.waypoints ?? []);
+    // Prepend the robot's current position so the user sees the leg
+    // Choppy will drive first. Skip when robot pos is missing so we
+    // don't anchor the path at (0,0).
+    const robot = this.robot;
+    const chain: Array<[number, number]> = [];
+    if (robot) chain.push(project(robot.longitude, robot.latitude));
+    for (const p of pts) chain.push(project(p.lon, p.lat));
+    const polylineD = chain.length >= 2
+      ? "M " + chain.map(([x, y]) => `${x.toFixed(2)} ${y.toFixed(2)}`).join(" L ")
+      : "";
+    const dots = pts.map((p, i) => {
+      const [x, y] = project(p.lon, p.lat);
+      const label = p.label ?? String(i + 1);
+      return svg`
+        <g
+          transform="translate(${x.toFixed(2)},${y.toFixed(2)})"
+          data-waypoint-idx=${i}
+          style="cursor: pointer;"
+        >
+          <circle r=${r + stroke} fill="#000000" fill-opacity="0.35" />
+          <circle r=${r} fill=${accent} stroke="#ffffff" stroke-width=${stroke} />
+          <text
+            text-anchor="middle"
+            dominant-baseline="central"
+            font-size=${(r * 1.15).toFixed(2)}
+            font-weight="700"
+            fill="#ffffff"
+            style="pointer-events: none;"
+          >${label}</text>
+        </g>
+      `;
+    });
+    return svg`
+      <g class="waypoints">
+        ${polylineD
+          ? svg`<path d=${polylineD}
+              fill="none" stroke=${accent}
+              stroke-width=${(stroke * 1.2).toFixed(2)}
+              stroke-dasharray=${`${(r * 0.45).toFixed(1)} ${(r * 0.55).toFixed(1)}`}
+              stroke-linecap="round"
+              vector-effect="non-scaling-stroke"
+            />`
+          : ""}
+        ${dots}
+      </g>
+    `;
+  }
+
   // ----- interaction -----
 
   private _clampCenter(): void {
@@ -842,14 +964,96 @@ class YarboMap extends LitElement {
     if (!this._svg) return null;
     const rect = this._svg.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return null;
-    const fx = (ev.clientX - rect.left) / rect.width; // 0..1
-    const fy = (ev.clientY - rect.top) / rect.height;
+    // Mobile correction: when the page's visual viewport differs from the
+    // layout viewport (Android/iOS address-bar collapse, pinch-zoom),
+    // PointerEvent.clientX/Y are reported in layout-viewport space while
+    // the user's finger targets the visual viewport. getBoundingClientRect
+    // also returns layout-viewport coords, so we offset the click point
+    // back into the same frame.
+    const vv = (typeof window !== "undefined" && window.visualViewport) || null;
+    const ox = vv ? vv.offsetLeft : 0;
+    const oy = vv ? vv.offsetTop : 0;
     const vbW = this._baseW / this._zoom;
     const vbH = this._baseH / this._zoom;
+    // preserveAspectRatio="xMidYMid meet": the viewBox is scaled to the
+    // largest size that fits the element, then centered. The leftover
+    // dimension is split into letterbox bands. A tap inside a band is
+    // outside the rendered map, but our caller still gets a coord — so
+    // unwind the padding here. Without this, every click is offset by
+    // half the letterbox in whichever dimension is "loose".
+    const pxPerUnit = Math.min(rect.width / vbW, rect.height / vbH);
+    const renderedW = vbW * pxPerUnit;
+    const renderedH = vbH * pxPerUnit;
+    const padX = (rect.width - renderedW) / 2;
+    const padY = (rect.height - renderedH) / 2;
+    const fx = (ev.clientX - rect.left + ox - padX) / renderedW;
+    const fy = (ev.clientY - rect.top + oy - padY) / renderedH;
     return {
       x: this._cx - vbW / 2 + fx * vbW,
       y: this._cy - vbH / 2 + fy * vbH,
     };
+  }
+
+  /** Even-odd ray cast point-in-polygon. Handles MultiPolygon by OR'ing
+   * over its component polygons and Polygon holes by XOR'ing rings
+   * (matches GeoJSON winding-agnostic semantics). */
+  private _isInsideAnyArea(lon: number, lat: number): boolean {
+    const feats = this.geojson?.features ?? [];
+    for (const f of feats) {
+      if (f.properties?.zone_type !== "areas") continue;
+      const g = f.geometry as
+        | { type: "Polygon"; coordinates: number[][][] }
+        | { type: "MultiPolygon"; coordinates: number[][][][] }
+        | undefined;
+      if (!g) continue;
+      const polys = g.type === "Polygon" ? [g.coordinates] : g.type === "MultiPolygon" ? g.coordinates : [];
+      for (const rings of polys) {
+        let inside = false;
+        for (const ring of rings) {
+          if (this._pointInRing(lon, lat, ring)) inside = !inside;
+        }
+        if (inside) return true;
+      }
+    }
+    return false;
+  }
+
+  /** True if the point lands in any no-go zone that's currently enabled. */
+  private _isInsideEnabledNogo(lon: number, lat: number): boolean {
+    const feats = this.geojson?.features ?? [];
+    const disabled = this.disabledNogoIds instanceof Set ? this.disabledNogoIds : null;
+    for (const f of feats) {
+      if (f.properties?.zone_type !== "nogozones") continue;
+      const id = f.properties?.id;
+      if (id != null && disabled?.has(String(id))) continue;
+      const g = f.geometry as
+        | { type: "Polygon"; coordinates: number[][][] }
+        | { type: "MultiPolygon"; coordinates: number[][][][] }
+        | undefined;
+      if (!g) continue;
+      const polys = g.type === "Polygon" ? [g.coordinates] : g.type === "MultiPolygon" ? g.coordinates : [];
+      for (const rings of polys) {
+        let inside = false;
+        for (const ring of rings) {
+          if (this._pointInRing(lon, lat, ring)) inside = !inside;
+        }
+        if (inside) return true;
+      }
+    }
+    return false;
+  }
+
+  private _pointInRing(x: number, y: number, ring: number[][]): boolean {
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const xi = ring[i][0], yi = ring[i][1];
+      const xj = ring[j][0], yj = ring[j][1];
+      const intersect =
+        ((yi > y) !== (yj > y)) &&
+        (x < ((xj - xi) * (y - yi)) / (yj - yi || 1e-20) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
   }
 
   private _zoomBy(factor: number): void {
@@ -908,6 +1112,11 @@ class YarboMap extends LitElement {
     if (ev.button !== 0 && ev.pointerType === "mouse") return;
     const target = ev.target as Element;
     if (target && target.closest(".zoom-controls, .legend")) return;
+    // Capture marker index for tap-to-delete (resolved on pointerup).
+    const markerEl = target?.closest?.("[data-waypoint-idx]") as Element | null;
+    this._pointerDownWaypointIdx = markerEl
+      ? Number.parseInt(markerEl.getAttribute("data-waypoint-idx") ?? "-1", 10)
+      : null;
     ev.preventDefault();
     (ev.currentTarget as Element).setPointerCapture?.(ev.pointerId);
     this._pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
@@ -976,8 +1185,42 @@ class YarboMap extends LitElement {
       return;
     }
     if (this._activePointer === ev.pointerId) {
+      const dx = ev.clientX - this._dragStartX;
+      const dy = ev.clientY - this._dragStartY;
+      const moved = Math.hypot(dx, dy);
       this._activePointer = null;
       this._dragging = false;
+      // Tap (vs drag) detection.
+      if (this.waypointMode && moved < 6) {
+        if (this._pointerDownWaypointIdx !== null
+            && this._pointerDownWaypointIdx >= 0) {
+          // Tap on existing marker → delete it.
+          this.dispatchEvent(new CustomEvent("waypoint-click", {
+            detail: { index: this._pointerDownWaypointIdx },
+            bubbles: true, composed: true,
+          }));
+        } else {
+          const v = this._screenToWorld(ev);
+          if (v) {
+            const lon = this._projMinLon
+              + (v.x / this._baseW) * this._projSpanLon / this._projLonScale;
+            const lat = this._projMinLat
+              + ((this._baseH - v.y) / this._baseH) * this._projSpanLat;
+            // Reject taps outside any mowable area OR inside an enabled
+            // no-go zone — both will fail planning_status=-23 if sent,
+            // and we'd rather give immediate feedback. Disabled no-go
+            // zones are passable (user explicitly released them) so we
+            // don't gate on those.
+            const inArea = this._isInsideAnyArea(lon, lat);
+            const inNogo = this._isInsideEnabledNogo(lon, lat);
+            this.dispatchEvent(new CustomEvent("map-click", {
+              detail: { lat, lon, inArea, inNogo },
+              bubbles: true, composed: true,
+            }));
+          }
+        }
+      }
+      this._pointerDownWaypointIdx = null;
     }
   };
 

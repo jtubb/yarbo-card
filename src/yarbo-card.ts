@@ -1,9 +1,12 @@
-import { LitElement, html, css, nothing, type PropertyValues, type TemplateResult } from "lit";
+import { LitElement, html, css, unsafeCSS, nothing, type PropertyValues, type TemplateResult } from "lit";
 import { property, state } from "lit/decorators.js";
 import type { YarboCardConfig, HomeAssistant, YarboEntities } from "./types";
 import { resolveEntities, inferPrefix, deviceName } from "./entities";
+import { renderSchedulerSection, SCHEDULER_CSS } from "./scheduler-section";
 import "./map-view";
 import type { GeoJsonFeatureCollection, TrailPhase, TrailPoint } from "./map-view";
+import "./mesh-view";
+import type { MeshData, MeshMode, MeshStyle } from "./mesh-view";
 
 const CARD_VERSION = "0.1.0";
 
@@ -96,6 +99,26 @@ class YarboCard extends LitElement {
     pct: number;
   };
 
+  // Per-device terrain mesh state. _meshData is null until first fetch,
+  // {} when fetched but empty for this device.
+  @state() private _meshData: MeshData | null = null;
+  @state() private _meshMode: MeshMode = "3d";
+  @state() private _meshStyle: MeshStyle = "fill";
+  @state() private _meshLoading = false;
+  @state() private _meshError: string | null = null;
+  @state() private _meshExpanded = false;
+  // null = show all areas; otherwise the subset to render.
+  @state() private _meshAreas: Set<string> | null = null;
+
+  // Waypoint composer state. Each waypoint stored as {lat, lon} so the
+  // map renders it without lossy round-trips through CombinedOdom xy;
+  // we convert to local meters only when dispatching the service.
+  @state() private _waypointMode = false;
+  @state() private _waypoints: Array<{lat: number; lon: number}> = [];
+  @state() private _waypointType = 0;
+  @state() private _waypointBusy = false;
+  @state() private _waypointError: string | null = null;
+
   public connectedCallback(): void {
     super.connectedCallback();
     this._tickHandle = setInterval(() => {
@@ -146,8 +169,15 @@ class YarboCard extends LitElement {
     const autoStatus = ents.autoPlanStatus
       ? this.hass!.states[ents.autoPlanStatus]?.state
       : undefined;
-    const phase = this._phaseFor(autoStatus);
+    let phase = this._phaseFor(autoStatus);
     const isCleaning = autoStatus === "Cleaning";
+    // "Recharging" is only meaningful mid-plan. If we're not currently
+    // tracking a run, treat it as idle (don't anchor a new "plan" off
+    // a docked-charging state). Once a plan is in flight, recharging
+    // keeps the trail alive across the auto-recharge cycle.
+    if (phase === "recharging" && this._planStartedAt === null) {
+      phase = null;
+    }
     const isIdle = phase === null;
 
     if (isIdle) {
@@ -190,7 +220,9 @@ class YarboCard extends LitElement {
     }
 
     const pos = this._extractRobotPosition(ents);
-    if (pos) this._appendTrailPoint(pos.longitude, pos.latitude, phase);
+    if (pos && phase !== null) {
+      this._appendTrailPoint(pos.longitude, pos.latitude, phase);
+    }
   }
 
   private _phaseFor(autoStatus: string | undefined): TrailPhase | null {
@@ -200,7 +232,16 @@ class YarboCard extends LitElement {
     if (autoStatus === "Waypoint Complete") return "cleaning";
     if (autoStatus === "Calculating Route") return "heading";
     if (autoStatus === "Heading to Area") return "heading";
-    return null; // Not Started / Completed / Error / unknown
+    // Mid-plan recharge cycles: keep the run/trail alive instead of
+    // letting the idle debounce reset everything. Caller gates this on
+    // an already-active plan (a docked mower at rest also reports
+    // these states without a real plan context).
+    if (autoStatus === "Charging") return "recharging";
+    if (autoStatus === "Returning on Path") return "recharging";
+    if (autoStatus === "Returning in Area") return "recharging";
+    if (autoStatus === "Repositioning") return "recharging";
+    if (autoStatus === "Verifying") return "recharging";
+    return null; // Not Started / Completed / Error / Standby / unknown
   }
 
   private _appendTrailPoint(
@@ -259,6 +300,8 @@ class YarboCard extends LitElement {
           ${this._renderControls(ents)}
           ${this._renderStatus(ents)}
           ${this._renderNogoZones(ents)}
+          ${this._renderScheduler(ents, prefix)}
+          ${this._renderMeshSection()}
           ${this._config.show_advanced ?? true ? this._renderAdvanced(ents) : nothing}
         </div>
       </ha-card>
@@ -288,6 +331,12 @@ class YarboCard extends LitElement {
         .disabledNogoIds=${disabledNogoIds}
         .colors=${this._config?.colors}
         .height=${this._config?.map_height ?? 240}
+        .waypointMode=${this._waypointMode}
+        .waypoints=${this._waypoints}
+        .idle=${!this._isMowerBusy(ents)}
+        @map-click=${this._onMapClick}
+        @waypoint-click=${this._onWaypointMarkerClick}
+        @request-waypoint-mode=${this._onWaypointModeRequest}
       ></yarbo-map>
     `;
   }
@@ -390,6 +439,17 @@ class YarboCard extends LitElement {
   }
 
   private _extractCoveragePct(ents: YarboEntities): number | null {
+    // Prefer the firmware-reported cumulative progress (preserved
+    // across mid-plan auto-recharges, matches the Yarbo app). Fall
+    // back to the local trail-vs-planned-path estimate when the
+    // sensor is missing or unavailable.
+    if (ents.planProgress) {
+      const s = this.hass!.states[ents.planProgress];
+      if (s && s.state !== "unknown" && s.state !== "unavailable") {
+        const v = Number.parseFloat(s.state);
+        if (Number.isFinite(v)) return v;
+      }
+    }
     const planned = this._extractPlannedPath(ents);
     if (!planned) return null;
     return this._computeCoverage(planned).pct;
@@ -520,6 +580,19 @@ class YarboCard extends LitElement {
     if (typeof v !== "number" || !Number.isFinite(v)) return null;
     return v;
   }
+
+  /** Firmware-reported plan progress 0-100, or null if unavailable.
+   * When ≥ COMPLETE_PROGRESS_PCT we treat the run as completed
+   * regardless of any lingering actualCleanArea > 0 in plan_feedback
+   * (which the firmware doesn't reset on completion). */
+  private _extractPlanProgressPct(ents: YarboEntities): number | null {
+    if (!ents.planProgress) return null;
+    const s = this.hass!.states[ents.planProgress];
+    if (!s || s.state === "unknown" || s.state === "unavailable") return null;
+    const v = Number.parseFloat(s.state);
+    return Number.isFinite(v) ? v : null;
+  }
+  private static readonly COMPLETE_PROGRESS_PCT = 99;
 
   private _extractPlanAreaIds(ents: YarboEntities): Set<string> | undefined {
     if (!ents.planSelect) return undefined;
@@ -822,7 +895,15 @@ class YarboCard extends LitElement {
       pauseStatus !== "unknown" &&
       pauseStatus !== "unavailable";
     const cleanedArea = this._extractCleanedArea(ents);
-    const interruptedPlan = !running && cleanedArea != null && cleanedArea > 0;
+    const progressPct = this._extractPlanProgressPct(ents);
+    // A "resumable" plan needs cleanedArea > 0 AND progress < the
+    // completion threshold. After a real completion the firmware
+    // leaves actualCleanArea > 0 indefinitely; without the progress
+    // gate we'd misread that as "interrupted, can resume".
+    const interruptedPlan =
+      !running &&
+      cleanedArea != null && cleanedArea > 0 &&
+      (progressPct == null || progressPct < YarboCard.COMPLETE_PROGRESS_PCT);
     const activeOrResumable = running || explicitlyPaused || interruptedPlan;
     if (activeOrResumable) {
       const planName = plan?.state;
@@ -903,6 +984,11 @@ class YarboCard extends LitElement {
   }
 
   private _renderControls(ents: YarboEntities): TemplateResult {
+    // Waypoint composer takes over the control row while active: the
+    // pause/resume/dock buttons make no sense before a path is sent, and
+    // the user needs a way to commit / wipe / abort placement.
+    if (this._waypointMode) return this._renderWaypointControls(ents);
+
     // Determine the primary action for the current state. Only one
     // action is ever the "right" thing to press at a time — promote it
     // to full width; demote the rest to a compact icon row.
@@ -923,8 +1009,11 @@ class YarboCard extends LitElement {
       pauseStatus !== "unknown" &&
       pauseStatus !== "unavailable";
     const cleanedArea = this._extractCleanedArea(ents);
+    const progressPct = this._extractPlanProgressPct(ents);
     const interruptedPlan =
-      !running && cleanedArea != null && cleanedArea > 0;
+      !running &&
+      cleanedArea != null && cleanedArea > 0 &&
+      (progressPct == null || progressPct < YarboCard.COMPLETE_PROGRESS_PCT);
     const canResume = explicitlyPaused || interruptedPlan;
 
     let primary: {
@@ -991,6 +1080,54 @@ class YarboCard extends LitElement {
     `;
   }
 
+  private _renderWaypointControls(ents: YarboEntities): TemplateResult {
+    const ref = this._extractGpsRef(ents);
+    const count = this._waypoints.length;
+    const canStart = !!ref && count > 0 && !this._waypointBusy;
+    return html`
+      <div class="controls">
+        <button
+          class="primary-ctrl"
+          ?disabled=${!canStart}
+          @click=${() => ref && void this._sendWaypoints(ref)}
+          aria-label="Start"
+        >
+          <ha-icon icon="mdi:play"></ha-icon>
+          <span>${this._waypointBusy ? "Sending…" : `Start (${count})`}</span>
+        </button>
+        <div class="secondary-ctrls">
+          <button
+            class="icon-ctrl"
+            ?disabled=${count === 0 || this._waypointBusy}
+            @click=${() => { this._waypoints = []; this._waypointError = null; }}
+            title="Clear waypoints"
+            aria-label="Clear"
+          >
+            <ha-icon icon="mdi:close-circle-outline"></ha-icon>
+            <span class="icon-ctrl-label">Clear</span>
+          </button>
+          <button
+            class="icon-ctrl"
+            ?disabled=${this._waypointBusy}
+            @click=${() => {
+              this._waypointMode = false;
+              this._waypoints = [];
+              this._waypointError = null;
+            }}
+            title="Cancel waypoint mode"
+            aria-label="Cancel"
+          >
+            <ha-icon icon="mdi:cancel"></ha-icon>
+            <span class="icon-ctrl-label">Cancel</span>
+          </button>
+        </div>
+        ${this._waypointError
+          ? html`<div class="wp-error">${this._waypointError}</div>`
+          : nothing}
+      </div>
+    `;
+  }
+
   private _isAnyPhaseActive(ents: YarboEntities): boolean {
     if (!ents.autoPlanStatus) return false;
     const s = this.hass!.states[ents.autoPlanStatus]?.state;
@@ -1047,6 +1184,23 @@ class YarboCard extends LitElement {
     `;
   }
 
+  private _renderScheduler(
+    _ents: YarboEntities,
+    prefix: string,
+  ): TemplateResult | typeof nothing {
+    const sched = this._config?.scheduler;
+    if (!sched || !sched.enabled || !this.hass) return nothing;
+    // Schedule entities are integration-provided and discovered by
+    // entity-id pattern (sensor.<prefix>_schedule_*); the section
+    // dispatches button.press / switch.toggle directly. The card
+    // doesn't need to inject service-call handlers.
+    return renderSchedulerSection({
+      hass: this.hass,
+      prefix,
+      config: sched,
+    });
+  }
+
   private _extractDeviceId(ents: YarboEntities): string | undefined {
     // We need the HA device_id (registry uuid) for the service call.
     // Look it up via any of our known entities → entity registry → device_id.
@@ -1057,6 +1211,281 @@ class YarboCard extends LitElement {
       entities?: Record<string, { device_id?: string }>;
     }).entities;
     return entries?.[anchor]?.device_id;
+  }
+
+  private _renderMeshSection(): TemplateResult | typeof nothing {
+    if (!this.hass) return nothing;
+    const scoped = this._areaScopedData();
+    const areaIds = scoped ? Object.keys(scoped.areas) : [];
+    const allSelected =
+      this._meshAreas === null || this._meshAreas.size === areaIds.length;
+    return html`
+      <details
+        class="mesh"
+        ?open=${this._meshExpanded}
+        @toggle=${(e: Event) => {
+          this._meshExpanded = (e.target as HTMLDetailsElement).open;
+          if (this._meshExpanded && this._meshData === null && !this._meshLoading) {
+            void this._fetchMesh();
+          }
+        }}
+      >
+        <summary>
+          <span>Terrain mesh</span>
+          <span class="mesh-meta">
+            ${this._meshLoading
+              ? "loading…"
+              : scoped
+                ? `${areaIds.length} area(s)`
+                : "tap to load"}
+          </span>
+        </summary>
+        <div class="mesh-controls">
+          <button
+            class=${this._meshMode === "2d" ? "active" : ""}
+            @click=${() => (this._meshMode = "2d")}
+          >2D</button>
+          <button
+            class=${this._meshMode === "3d" ? "active" : ""}
+            @click=${() => (this._meshMode = "3d")}
+          >3D</button>
+          <span class="mesh-sep"></span>
+          <button
+            class=${this._meshStyle === "fill" ? "active" : ""}
+            @click=${() => (this._meshStyle = "fill")}
+            title="Solid (hypsometric tint)"
+          >Fill</button>
+          <button
+            class=${this._meshStyle === "wire" ? "active" : ""}
+            @click=${() => (this._meshStyle = "wire")}
+            title="Wireframe (triangle edges only)"
+          >Wire</button>
+          <button @click=${() => void this._fetchMesh()} title="Refresh from integration">
+            ↻
+          </button>
+        </div>
+        ${areaIds.length > 1
+          ? html`
+              <div class="mesh-areas">
+                <span class="mesh-areas-label">Areas:</span>
+                <label class="mesh-area-pill">
+                  <input
+                    type="checkbox"
+                    .checked=${allSelected}
+                    @change=${(e: Event) => this._toggleAllAreas(
+                      (e.target as HTMLInputElement).checked, areaIds,
+                    )}
+                  />
+                  <span>All</span>
+                </label>
+                ${areaIds.map((id) => {
+                  const on = this._meshAreas === null || this._meshAreas.has(id);
+                  return html`
+                    <label class="mesh-area-pill ${on ? "on" : ""}">
+                      <input
+                        type="checkbox"
+                        .checked=${on}
+                        @change=${(e: Event) => this._toggleArea(
+                          id, (e.target as HTMLInputElement).checked, areaIds,
+                        )}
+                      />
+                      <span>${id}</span>
+                    </label>
+                  `;
+                })}
+              </div>
+            `
+          : nothing}
+        ${this._meshError
+          ? html`<div class="mesh-error">${this._meshError}</div>`
+          : nothing}
+        ${scoped
+          ? html`<yarbo-mesh-view
+              .data=${scoped}
+              .mode=${this._meshMode}
+              .renderStyle=${this._meshStyle}
+              .selectedAreas=${this._meshAreas}
+            ></yarbo-mesh-view>`
+          : html`<div class="mesh-empty">
+              ${this._meshLoading ? "Loading mesh…" : "Tap refresh to load."}
+            </div>`}
+      </details>
+    `;
+  }
+
+  // ---- Waypoint composer ----
+
+  /** True when the mower is actively running a plan (or has one paused),
+   * which gates entry into waypoint mode. */
+  private _isMowerBusy(ents: YarboEntities): boolean {
+    if (this._cleaningStartedAt !== null) return true;
+    if (this._isAnyPhaseActive(ents)) return true;
+    const pauseStatus = ents.autoPlanPause
+      ? this.hass?.states[ents.autoPlanPause]?.state
+      : undefined;
+    if (pauseStatus &&
+        pauseStatus !== "Not Paused" &&
+        pauseStatus !== "unknown" &&
+        pauseStatus !== "unavailable") return true;
+    return false;
+  }
+
+  private _onMapClick = (e: CustomEvent): void => {
+    if (!this._waypointMode) return;
+    const { lat, lon, inArea, inNogo } = e.detail as {
+      lat: number; lon: number; inArea?: boolean; inNogo?: boolean;
+    };
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    if (inNogo === true) {
+      this._waypointError = "Can't drop a waypoint inside a no-go zone.";
+      return;
+    }
+    if (inArea === false) {
+      this._waypointError = "Tap inside a mowable area.";
+      return;
+    }
+    this._waypoints = [...this._waypoints, { lat, lon }];
+    this._waypointError = null;
+  };
+
+  private _onWaypointMarkerClick = (e: CustomEvent): void => {
+    const { index } = e.detail as { index: number };
+    if (!Number.isInteger(index) || index < 0) return;
+    this._waypoints = this._waypoints.filter((_, j) => j !== index);
+    this._waypointError = null;
+  };
+
+  private _onWaypointModeRequest = (e: CustomEvent): void => {
+    const { active } = e.detail as { active: boolean };
+    this._waypointMode = !!active;
+    if (!active) {
+      this._waypoints = [];
+      this._waypointError = null;
+    }
+  };
+
+  /** Pull GPS reference lat/lon from the device_tracker's attributes. */
+  private _extractGpsRef(ents: YarboEntities): { lat: number; lon: number } | null {
+    if (!ents.deviceTracker || !this.hass) return null;
+    const s = this.hass.states[ents.deviceTracker];
+    const a = s?.attributes as Record<string, unknown> | undefined;
+    if (!a) return null;
+    const lat = a.gps_ref_latitude;
+    const lon = a.gps_ref_longitude;
+    if (typeof lat !== "number" || typeof lon !== "number") return null;
+    return { lat, lon };
+  }
+
+  /** lat/lon → CombinedOdom local meters (origin = gps_ref).
+   *
+   * Yarbo's local frame is +X = WEST, +Y = NORTH (per SDK
+   * convert_local_to_gps). Lon decreases as we go west, so the x sign
+   * is inverted relative to a naïve (lon - ref) projection. The SDK
+   * forward function is `lon = ref_lon - x / m_per_deg_lon`; this is
+   * the inverse.
+   */
+  private _latLonToLocal(
+    lat: number, lon: number, ref: { lat: number; lon: number },
+  ): { x: number; y: number } {
+    const M_PER_DEG_LAT = 111_320;
+    const x = (ref.lon - lon) * M_PER_DEG_LAT * Math.cos((ref.lat * Math.PI) / 180);
+    const y = (lat - ref.lat) * M_PER_DEG_LAT;
+    return { x, y };
+  }
+
+  private async _sendWaypoints(ref: { lat: number; lon: number }): Promise<void> {
+    if (!this.hass || this._waypoints.length === 0) return;
+    const ents = resolveEntities(this.hass, this._prefix!);
+    const deviceId = this._extractDeviceId(ents);
+    if (!deviceId) {
+      this._waypointError = "Could not resolve device_id";
+      return;
+    }
+    const points = this._waypoints.map((w) => {
+      const { x, y } = this._latLonToLocal(w.lat, w.lon, ref);
+      return { x: Number(x.toFixed(3)), y: Number(y.toFixed(3)), phi: 0 };
+    });
+    this._waypointBusy = true;
+    this._waypointError = null;
+    try {
+      await this.hass.callService("yarbo", "goto_waypoints", {
+        device_id: deviceId,
+        points,
+        type: this._waypointType,
+      });
+      // Success — drop out of waypoint mode so the normal pause/dock
+      // controls return for the in-progress run.
+      this._waypoints = [];
+      this._waypointMode = false;
+    } catch (err) {
+      console.warn("yarbo-card: goto_waypoints failed", err);
+      this._waypointError = (err as Error)?.message ?? "goto_waypoints failed";
+    } finally {
+      this._waypointBusy = false;
+    }
+  }
+
+  private _toggleAllAreas(on: boolean, ids: string[]): void {
+    this._meshAreas = on ? null : new Set();
+  }
+
+  private _toggleArea(id: string, on: boolean, all: string[]): void {
+    const cur = this._meshAreas
+      ? new Set(this._meshAreas)
+      : new Set(all);
+    if (on) cur.add(id); else cur.delete(id);
+    // Collapse to null if everything is checked again.
+    this._meshAreas = cur.size === all.length ? null : cur;
+  }
+
+  /** Return MeshData scoped to the device this card is showing. */
+  private _areaScopedData(): MeshData | undefined {
+    if (!this._meshData || !this._prefix) return undefined;
+    // Service returns {devices: {sn: {gps_ref, areas}}} — pick our SN.
+    // _prefix is the slugified device name, sn is the serial. Look it
+    // up via the online sensor's device entry.
+    const ents = resolveEntities(this.hass!, this._prefix);
+    const anchor = ents.online ?? ents.battery;
+    if (!anchor || !this.hass) return undefined;
+    const entityEntry = (this.hass as unknown as {
+      entities?: Record<string, { device_id?: string }>;
+    }).entities?.[anchor];
+    const devices = (this.hass as unknown as {
+      devices?: Record<string, { identifiers?: Array<[string, string]> }>;
+    }).devices;
+    if (!entityEntry?.device_id || !devices) return undefined;
+    const dev = devices[entityEntry.device_id];
+    const id = dev?.identifiers?.find((i) => i[0] === "yarbo");
+    const sn = id?.[1];
+    if (!sn) return undefined;
+    const root = this._meshData as unknown as {
+      devices: Record<string, MeshData>;
+    };
+    return root.devices?.[sn];
+  }
+
+  private async _fetchMesh(): Promise<void> {
+    if (!this.hass) return;
+    this._meshLoading = true;
+    this._meshError = null;
+    try {
+      const result = await (this.hass as unknown as {
+        callWS: (msg: Record<string, unknown>) => Promise<unknown>;
+      }).callWS({
+        type: "call_service",
+        domain: "yarbo",
+        service: "get_altitude_mesh",
+        return_response: true,
+      });
+      const response = (result as { response?: unknown })?.response;
+      // The shape is {devices: {sn: {gps_ref, areas}}}; cache as-is.
+      this._meshData = (response as MeshData) ?? null;
+    } catch (e) {
+      console.warn("yarbo-card: get_altitude_mesh failed", e);
+      this._meshError = "Failed to load mesh.";
+    } finally {
+      this._meshLoading = false;
+    }
   }
 
   private async _toggleNogoZone(
@@ -1222,6 +1651,17 @@ class YarboCard extends LitElement {
       recharging !== "unknown"
     ) {
       return recharging;
+    }
+    // Sitting on the dock: rechargingStatus reflects the dock-approach
+    // state machine ("Returning on Path" → "Charging" → "Not Started"
+    // once settled), so once docked it returns to Not Started even
+    // though contactor power is still flowing. Fall back to the
+    // persistent charging binary sensor for the steady-state case.
+    if (
+      ents.charging &&
+      this.hass!.states[ents.charging]?.state === "on"
+    ) {
+      return "Charging";
     }
     const working = ents.workingState
       ? this.hass!.states[ents.workingState]?.state
@@ -1858,6 +2298,103 @@ class YarboCard extends LitElement {
       border-top: 1px solid var(--divider-color);
       padding-top: 8px;
     }
+    .mesh {
+      border-top: 1px solid var(--divider-color);
+      padding-top: 8px;
+    }
+    .wp-error {
+      flex-basis: 100%;
+      padding: 6px 4px 0;
+      color: var(--error-color, #c33);
+      font-size: 0.82rem;
+    }
+    .mesh summary {
+      cursor: pointer;
+      color: var(--primary-text-color);
+      font-size: 0.9rem;
+      font-weight: 500;
+      list-style: none;
+      user-select: none;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .mesh summary::-webkit-details-marker { display: none; }
+    .mesh-meta {
+      color: var(--secondary-text-color);
+      font-size: 0.8rem;
+      margin-left: auto;
+    }
+    .mesh-controls {
+      display: flex;
+      gap: 6px;
+      margin: 8px 0;
+    }
+    .mesh-controls button {
+      background: var(--card-background-color);
+      color: var(--primary-text-color);
+      border: 1px solid var(--divider-color);
+      border-radius: 4px;
+      padding: 4px 10px;
+      cursor: pointer;
+      font-size: 0.8rem;
+    }
+    .mesh-controls button.active {
+      background: var(--primary-color);
+      color: var(--text-primary-color, #fff);
+      border-color: var(--primary-color);
+    }
+    .mesh-sep {
+      width: 1px;
+      height: 18px;
+      background: var(--divider-color);
+      margin: 0 4px;
+    }
+    .mesh-empty, .mesh-error {
+      padding: 12px;
+      color: var(--secondary-text-color);
+      font-size: 0.85rem;
+    }
+    .mesh-error { color: var(--error-color, #c33); }
+    yarbo-mesh-view {
+      width: 100%;
+      height: 360px;
+      display: block;
+    }
+    .mesh-areas {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .mesh-areas-label {
+      color: var(--secondary-text-color);
+      font-size: 0.8rem;
+      margin-right: 4px;
+    }
+    .mesh-area-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border: 1px solid var(--divider-color);
+      border-radius: 12px;
+      font-size: 0.78rem;
+      cursor: pointer;
+      user-select: none;
+      background: var(--card-background-color);
+      color: var(--secondary-text-color);
+    }
+    .mesh-area-pill input {
+      margin: 0;
+      cursor: pointer;
+    }
+    .mesh-area-pill.on {
+      background: var(--primary-color);
+      color: var(--text-primary-color, #fff);
+      border-color: var(--primary-color);
+    }
     .nogo summary {
       cursor: pointer;
       color: var(--primary-text-color);
@@ -1988,6 +2525,7 @@ class YarboCard extends LitElement {
       color: var(--primary-text-color);
       background: var(--secondary-background-color);
     }
+    ${unsafeCSS(SCHEDULER_CSS)}
   `;
 }
 

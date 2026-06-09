@@ -18,6 +18,7 @@ const SUFFIX_MAP: { key: keyof YarboEntities; domain: string; suffix: string }[]
   { key: "planSelect", domain: "select", suffix: "plan_select" },
   { key: "workingStateSelect", domain: "select", suffix: "working_state" },
   { key: "planStartPercent", domain: "number", suffix: "plan_start_percent" },
+  { key: "planProgress", domain: "sensor", suffix: "plan_progress" },
   { key: "volume", domain: "number", suffix: "volume" },
   { key: "startPlan", domain: "button", suffix: "start_plan" },
   { key: "pausePlan", domain: "button", suffix: "pause_plan" },
