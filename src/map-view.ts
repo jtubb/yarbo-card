@@ -145,11 +145,20 @@ class YarboMap extends LitElement {
   @property({ attribute: false }) public trail?: Array<TrailPoint>;
   /** GeoJSON FeatureCollection of LineString features — the projected
    * path the robot plans to drive for the current running plan. Rendered
-   * beneath the trail so the completed portion visually "covers" it. */
+   * beneath the trail so the completed portion visually "covers" it.
+   * Each feature carries `properties.area_id`; we use that to color
+   * per-area segments by lifecycle (done / active / queued). */
   @property({ attribute: false }) public plannedPath?: GeoJsonFeatureCollection;
   /** Area IDs belonging to the currently running plan (not just the
    * selected one). Used to highlight zones during execution. */
   @property({ attribute: false }) public runningAreaIds?: Set<string>;
+  /** Area ID currently being mowed (`cleanAreaId` from plan_feedback).
+   * The matching plan-path segment is drawn in the active color. */
+  @property({ attribute: false }) public runningAreaId?: string;
+  /** Set of area IDs already finished in the current run
+   * (`finishIds` from plan_feedback). Their plan-path segments
+   * fade out — done is done. */
+  @property({ attribute: false }) public finishedAreaIds?: Set<string>;
   /** Dynamic obstacles detected during the current run, as a GeoJSON
    * FeatureCollection of Point/MultiPoint features. Rendered on top of
    * zones but beneath the robot glyph. */
@@ -181,6 +190,10 @@ class YarboMap extends LitElement {
   @state() private _fullscreen = false;
   @state() private _legendOpen = false;
   @state() private _menuOpen = false;
+  /** Toggle for the planned-route overlay. Defaults to on whenever a
+   * plan path is available; the menu item lets the user dim it out
+   * if it crowds the map. */
+  @state() private _showPlannedRoute = true;
 
   // Cached base viewport dims (set in render)
   private _baseW = 1000;
@@ -668,6 +681,25 @@ class YarboMap extends LitElement {
                     <ha-icon icon="mdi:map-marker-plus"></ha-icon>
                     <span>${this.waypointMode ? "Exit waypoint" : "Goto waypoint"}</span>
                   </button>
+                  ${this.plannedPath && this.plannedPath.features?.length
+                    ? html`
+                        <button
+                          class="zoom-menu-item ${this._showPlannedRoute ? "active" : ""}"
+                          @click=${() => {
+                            this._showPlannedRoute = !this._showPlannedRoute;
+                            this._menuOpen = false;
+                          }}
+                          role="menuitem"
+                        >
+                          <ha-icon
+                            icon=${this._showPlannedRoute
+                              ? "mdi:vector-polyline"
+                              : "mdi:vector-polyline-remove"}
+                          ></ha-icon>
+                          <span>${this._showPlannedRoute ? "Hide planned route" : "Show planned route"}</span>
+                        </button>
+                      `
+                    : nothing}
                 </div>
               `
             : nothing}
@@ -722,11 +754,22 @@ class YarboMap extends LitElement {
     project: (lon: number, lat: number) => [number, number],
     c: Required<YarboColors>,
   ): SVGTemplateResult | null {
+    if (!this._showPlannedRoute) return null;
     const feats = this.plannedPath?.features;
     if (!feats || feats.length === 0) return null;
-    // Always render the entire planned path as a faint always-visible
-    // guide. "Completed" is shown by the GPS trail drawn on top.
-    const paths: SVGTemplateResult[] = [];
+    // Each feature is one area's planned path (carries area_id in
+    // properties). Pick a style based on lifecycle:
+    //   done    — area_id ∈ finishedAreaIds → faded, neutral
+    //   active  — area_id == runningAreaId  → emphasis, solid
+    //   queued  — everything else           → muted dashed (current behavior)
+    // Live GPS trail still draws on top, so within the active area
+    // the "completed" portion gets visually covered.
+    const done: SVGTemplateResult[] = [];
+    const queued: SVGTemplateResult[] = [];
+    const active: SVGTemplateResult[] = [];
+    const runId = this.runningAreaId != null ? String(this.runningAreaId) : null;
+    const finished = this.finishedAreaIds instanceof Set ? this.finishedAreaIds : null;
+
     for (const f of feats) {
       if (f.geometry?.type !== "LineString") continue;
       const pts = f.geometry.coordinates as number[][];
@@ -737,22 +780,33 @@ class YarboMap extends LitElement {
           return `${x.toFixed(2)},${y.toFixed(2)}`;
         })
         .join(" L ");
-      paths.push(svg`
+      const areaId = f.properties?.area_id != null
+        ? String(f.properties.area_id)
+        : null;
+      const isDone = areaId != null && finished?.has(areaId) === true;
+      const isActive = areaId != null && areaId === runId;
+      const bucket = isDone ? done : isActive ? active : queued;
+      const stroke = isActive ? c.trail_transit : c.trail_planned;
+      const width = isActive ? 2.4 : 2;
+      const dash = isActive ? "" : isDone ? "2 6" : "5 5";
+      const opacity = isDone ? 0.35 : isActive ? 0.9 : 0.65;
+      bucket.push(svg`
         <path
           d=${d}
           fill="none"
-          stroke=${c.trail_planned}
-          stroke-width="2"
-          stroke-dasharray="5 5"
+          stroke=${stroke}
+          stroke-width=${width}
+          stroke-dasharray=${dash}
           stroke-linecap="round"
           stroke-linejoin="round"
-          stroke-opacity="0.65"
+          stroke-opacity=${opacity}
           vector-effect="non-scaling-stroke"
         />
       `);
     }
-    if (paths.length === 0) return null;
-    return svg`<g class="planned-path">${paths}</g>`;
+    if (done.length + queued.length + active.length === 0) return null;
+    // Z-order within the layer: done (bottom), queued, active (top).
+    return svg`<g class="planned-path">${done}${queued}${active}</g>`;
   }
 
   private _renderTrail(

@@ -61,6 +61,14 @@ class YarboCard extends LitElement {
   // (i.e. actively working). Phases like "Calculating Route" or
   // "Heading to Area" don't count toward "Running for ...".
   @state() private _trail: TrailPoint[] = [];
+  // Base work-zone map (GeoJSON). Fetched on demand via the yarbo/map_zones
+  // WebSocket command rather than read from the map_zones sensor attribute:
+  // the integration no longer exposes the full GeoJSON as an attribute (a
+  // complex map exceeds HA's 16 KB attribute limit). Refetched whenever the
+  // sensor signals the map changed.
+  @state() private _mapGeojson?: GeoJsonFeatureCollection;
+  private _mapZonesSig?: string;
+  private _mapFetchInFlight = false;
   // Live display value for sliders while dragging (entity state only
   // updates when the drag ends). Keyed by entity_id.
   @state() private _liveSlider: Record<string, number> = {};
@@ -160,6 +168,7 @@ class YarboCard extends LitElement {
     }
     if (this.hass && this._prefix) {
       this._syncPlanRun();
+      this._maybeFetchMapZones();
     }
     super.willUpdate(changed);
   }
@@ -309,11 +318,13 @@ class YarboCard extends LitElement {
   }
 
   private _renderMap(ents: YarboEntities): TemplateResult | typeof nothing {
-    const geojson = this._extractGeoJson(ents);
+    const geojson = this._mapGeojson;
     const robot = this._extractRobotPosition(ents);
     const planAreaIds = this._extractPlanAreaIds(ents);
     const plannedPath = this._extractPlannedPath(ents);
     const runningAreaIds = this._extractRunningAreaIds(ents);
+    const runningAreaId = this._extractRunningAreaId(ents);
+    const finishedAreaIds = this._extractFinishedAreaIds(ents);
     if (!geojson && !robot) return nothing;
     // While a plan is running, highlight the running areas instead of
     // whatever's selected in the dropdown (they may differ).
@@ -326,6 +337,8 @@ class YarboCard extends LitElement {
         .robot=${robot}
         .planAreaIds=${highlight}
         .plannedPath=${plannedPath}
+        .runningAreaId=${runningAreaId}
+        .finishedAreaIds=${finishedAreaIds}
         .trail=${this._trail.length > 1 ? this._trail : undefined}
         .obstacles=${obstacles}
         .disabledNogoIds=${disabledNogoIds}
@@ -573,6 +586,22 @@ class YarboCard extends LitElement {
     return new Set(raw.map((v) => String(v)));
   }
 
+  private _extractRunningAreaId(ents: YarboEntities): string | undefined {
+    if (!ents.planSelect) return undefined;
+    const s = this.hass!.states[ents.planSelect];
+    const v = s?.attributes?.running_area_id;
+    if (v === undefined || v === null || v === "") return undefined;
+    return String(v);
+  }
+
+  private _extractFinishedAreaIds(ents: YarboEntities): Set<string> | undefined {
+    if (!ents.planSelect) return undefined;
+    const s = this.hass!.states[ents.planSelect];
+    const raw = s?.attributes?.finished_area_ids;
+    if (!Array.isArray(raw) || raw.length === 0) return undefined;
+    return new Set(raw.map((v) => String(v)));
+  }
+
   private _extractCleanedArea(ents: YarboEntities): number | null {
     if (!ents.planSelect) return null;
     const s = this.hass!.states[ents.planSelect];
@@ -602,12 +631,52 @@ class YarboCard extends LitElement {
     return new Set(raw.map((v) => String(v)));
   }
 
-  private _extractGeoJson(ents: YarboEntities): GeoJsonFeatureCollection | undefined {
-    if (!ents.mapZones) return undefined;
+  /** Resolve the device serial (sn) via the entity → device registry. */
+  private _resolveSn(ents: YarboEntities): string | undefined {
+    const deviceId = this._extractDeviceId(ents);
+    if (!deviceId || !this.hass) return undefined;
+    const devices = (this.hass as unknown as {
+      devices?: Record<string, { identifiers?: Array<[string, string]> }>;
+    }).devices;
+    const id = devices?.[deviceId]?.identifiers?.find((i) => i[0] === "yarbo");
+    return id?.[1];
+  }
+
+  /**
+   * Refetch the base map over WebSocket when the map_zones sensor signals a
+   * change (or on first load). Cheap no-op when nothing changed.
+   */
+  private _maybeFetchMapZones(): void {
+    const ents = resolveEntities(this.hass!, this._prefix!);
+    if (!ents.mapZones) return;
     const s = this.hass!.states[ents.mapZones];
-    const gj = s?.attributes?.geojson as GeoJsonFeatureCollection | undefined;
-    if (!gj || !Array.isArray(gj.features)) return undefined;
-    return gj;
+    if (!s) return;
+    // map_zones writes state only when its summary changes, so last_updated is
+    // a reliable "map changed" signal; fall back to feature_count.
+    const sig = String(s.last_updated ?? s.attributes?.feature_count ?? "");
+    if (sig === this._mapZonesSig) return;
+    const sn = this._resolveSn(ents);
+    if (!sn) return;
+    this._mapZonesSig = sig;
+    void this._fetchMapZones(sn);
+  }
+
+  private async _fetchMapZones(sn: string): Promise<void> {
+    if (!this.hass || this._mapFetchInFlight) return;
+    this._mapFetchInFlight = true;
+    try {
+      const result = await (this.hass as unknown as {
+        callWS: (msg: Record<string, unknown>) => Promise<unknown>;
+      }).callWS({ type: "yarbo/map_zones", sn });
+      const gj = (result as { geojson?: GeoJsonFeatureCollection })?.geojson;
+      this._mapGeojson = gj && Array.isArray(gj.features) ? gj : undefined;
+    } catch (e) {
+      // ERR_NOT_FOUND until the first map refresh; harmless — retried when the
+      // sensor's signature next changes (i.e. when map data arrives).
+      console.warn("yarbo-card: yarbo/map_zones failed", e);
+    } finally {
+      this._mapFetchInFlight = false;
+    }
   }
 
   private _extractRobotPosition(
